@@ -1,7 +1,7 @@
 # DESIGN — HART Transmitter Reader
 
 เอกสารออกแบบซอฟต์แวร์สำหรับอ่านค่าจาก transmitter ผ่าน HART protocol พร้อม web app
-สถานะ: **ฉบับร่าง v0.1 — ยังไม่มีโค้ด** เอกสารนี้คือแผนที่จะใช้ลงมือสร้าง
+สถานะ: **v0.2 — Phase 0 และ 1 เสร็จกับ simulator แล้ว ยังไม่ได้ทดสอบกับ hardware จริง** (ดู §9)
 
 ---
 
@@ -24,7 +24,7 @@
 | ผู้ใช้คนเดียว/ทีมเล็กบน LAN | Multi-tenant, cloud, ระบบสิทธิ์ละเอียด |
 
 > **เหตุผลที่ v1 เป็น read-only:** คำสั่งเขียนเปลี่ยนพฤติกรรมของ transmitter ที่อาจกำลังควบคุมกระบวนการจริง
-> ชั้น application จะมี allowlist ของ command number ที่ส่งได้ คำสั่งนอก allowlist ถูกปฏิเสธตั้งแต่ก่อนเข้า data link
+> `Master` (จุดเดียวที่ส่ง byte ออก loop ได้) ตรวจ command number กับ allowlist ใน `hart/tables.py` ก่อนสร้าง frame เสมอ
 
 ---
 
@@ -185,14 +185,14 @@ class Transport(Protocol):
     async def close(self) -> None: ...
     async def write(self, data: bytes) -> None: ...      # จัดการ RTS ภายใน
     async def read(self, timeout: float) -> bytes: ...   # คืน bytes ที่มาถึงภายใน timeout
+    async def drain_input(self) -> None: ...             # ทิ้ง bytes ค้างก่อนเริ่ม transaction
 ```
 
 **Command definition** — 1 คำสั่ง = 1 class เล็ก ๆ ไม่มี I/O:
 ```python
-class Cmd3(Command):
+class ReadDynamicVariables(Command[DynamicVariables]):
     number = 3
-    def encode(self) -> bytes: return b""
-    def decode(self, data: bytes) -> DynamicVariables: ...   # รับ response สั้นกว่า 24 bytes ได้
+    def decode(self, payload: bytes) -> DynamicVariables: ...   # รับ response สั้นกว่า 24 bytes ได้
 ```
 
 **Simulator** เป็น `Transport` อีกตัวหนึ่งที่จำลอง transmitter หลายตัว (ตอบ bytes จริงตาม frame format,
@@ -208,11 +208,12 @@ class Cmd3(Command):
 │   ├── pyproject.toml
 │   ├── app/
 │   │   ├── main.py            สร้าง FastAPI app, lifespan เปิด/ปิด port
+│   │   ├── cli.py             hartcli: scan / read / monitor, dump frame
 │   │   ├── config.py          settings (env + ไฟล์ config)
 │   │   ├── hart/
 │   │   │   ├── transport/     base.py, serial.py, simulator.py
 │   │   │   ├── link/          frame.py, master.py, address.py
-│   │   │   ├── app/           commands/ (cmd000.py …), codec.py (float, packed ASCII, date)
+│   │   │   ├── app/           commands/, codec.py (float, packed ASCII), client.py (execute, identify, scan)
 │   │   │   ├── tables.py      unit codes, manufacturer IDs, response codes
 │   │   │   └── errors.py
 │   │   ├── services/          device_manager.py, poller.py, scanner.py, recorder.py
@@ -230,7 +231,6 @@ class Cmd3(Command):
 │       ├── api/               client.ts (REST), socket.ts (WS + reconnect)
 │       ├── stores/            สถานะอุปกรณ์/ค่าสด
 │       └── types/             สร้างจาก OpenAPI ของ backend
-├── tools/                     hartcli.py (ยิงคำสั่งเดี่ยว, dump frame)
 └── docs/                      wiring, รายการ modem ที่ทดสอบแล้ว
 ```
 
@@ -362,7 +362,7 @@ Client → server: `{"type":"subscribe","topics":["readings","frames"]}` — `fr
 
 ## 7. ความปลอดภัยและการ deploy
 - Default bind `127.0.0.1`; เปิดให้ LAN ต้องตั้งค่าเองและบังคับใส่ token (`Authorization: Bearer`) ทั้ง REST และ WS
-- Command allowlist บังคับใน `hart/app` ไม่ใช่ที่ API → ไม่มีทางอ้อมผ่าน endpoint อื่น
+- Command allowlist บังคับใน `hart/link/master.py` ไม่ใช่ที่ API → ไม่มีทางอ้อมผ่าน endpoint อื่น
 - Deploy: build frontend เป็น static แล้วให้ FastAPI เสิร์ฟ → รันคำสั่งเดียว, port เดียว
 - Config ผ่าน environment (`HART_PORT`, `HART_TRANSPORT=serial|simulator`, `HART_MASTER=primary|secondary`, `HART_DB_PATH`, `HART_BIND`, `HART_TOKEN`)
 
@@ -387,12 +387,16 @@ Frame จริงที่จับได้จากอุปกรณ์เ�
 
 | Phase | งาน | เสร็จเมื่อ (acceptance) |
 |---|---|---|
-| **0 — โครงโปรเจกต์** | สร้าง backend/frontend, lint, test runner, CI | `pytest` และ `npm test` ผ่านบน CI |
-| **1 — HART core** | codec, frame, master state machine, cmd 0/1/2/3, SerialTransport, SimulatorTransport, `hartcli` | `hartcli scan` และ `hartcli read 3` ได้ค่าถูกจาก simulator **และ** จาก transmitter จริง 1 ตัว |
+| **0 — โครงโปรเจกต์** ✅ | สร้าง backend/frontend, lint, test runner, CI | `pytest` และ `npm test` ผ่านบน CI |
+| **1 — HART core** ◐ | codec, frame, master state machine, cmd 0/1/2/3, SerialTransport, SimulatorTransport, `hartcli` | `hartcli scan` และ `hartcli read 3` ได้ค่าถูกจาก simulator **และ** จาก transmitter จริง 1 ตัว |
 | **2 — Backend service** | cmd 11–16, 20, DeviceManager, Scanner, Poller, SQLite, REST + WS | integration test ผ่าน; poll ต่อเนื่อง 24 ชม. กับ simulator ไม่มี leak/ค้าง |
 | **3 — Web app หลัก** | Dashboard, Scan, Device detail (Live/Info), Settings | ผู้ใช้เปิด browser → scan → เห็นค่าสดได้โดยไม่แตะ command line |
 | **4 — History + Diagnostics** | กราฟย้อนหลัง, CSV, cmd 9/48, event log, raw frame viewer, retention | E2E ผ่าน; ดูย้อนหลัง 30 วันโหลดไม่เกิน 2 วินาที |
 | **5 — เสริม** | HART-IP transport (UDP/TCP 5094), installer/Windows service, multidrop tuning | ตามลำดับความต้องการจริง |
+
+**สถานะ Phase 1:** ผ่านกับ simulator ครบ (unit + integration test, `hartcli scan/read/monitor`)
+**ยังค้าง: ทดสอบกับ modem และ transmitter จริง** — `SerialTransport` เขียนแล้วแต่ยังไม่เคยรันกับ hardware
+priority queue ของ bus (§3.5) ยังเป็น lock ธรรมดา จะเพิ่มใน Phase 2 พร้อม Poller
 
 ลำดับนี้ตั้งใจให้ **ความเสี่ยงสูงสุด (คุยกับ hardware จริง) ถูกพิสูจน์ใน Phase 1** ก่อนลงแรงกับ UI
 
@@ -402,7 +406,7 @@ Frame จริงที่จับได้จากอุปกรณ์เ�
 
 | ความเสี่ยง | ผลกระทบ | วิธีรับมือ |
 |---|---|---|
-| Modem แต่ละรุ่นจัดการ RTS/echo ต่างกัน | ส่งไม่ออก หรืออ่านเจอ frame ตัวเอง | RTS mode ปรับได้ (`auto`/`toggle`/`none`), ตัด echo ใน link layer, จดรุ่นที่ทดสอบแล้วใน docs |
+| Modem แต่ละรุ่นจัดการ RTS/echo ต่างกัน | ส่งไม่ออก หรืออ่านเจอ frame ตัวเอง | RTS mode ปรับได้ (`toggle`/`none`), ตัด echo ใน link layer, จดรุ่นที่ทดสอบแล้วใน docs |
 | Timing ของ USB-serial ไม่แม่น (latency timer) | ปล่อย RTS ช้า ชนกับคำตอบ | รอให้ tx buffer ว่างก่อนปล่อย, แนะนำตั้ง latency 1 ms, มี timeout ที่ปรับได้ |
 | มี master อื่นบน loop (DCS, handheld) | ชนกัน, timeout เป็นระยะ | เลือก secondary master ได้, retry + backoff, แสดงสถิติ error |
 | Multidrop หลายตัวทำให้ refresh ช้า | 15 ตัว ≈ 8 วินาที/รอบ | แสดง refresh rate จริงใน UI, ตั้ง interval ต่ออุปกรณ์ได้ |

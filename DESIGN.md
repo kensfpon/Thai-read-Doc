@@ -1,7 +1,7 @@
 # DESIGN — HART Transmitter Reader
 
 เอกสารออกแบบซอฟต์แวร์สำหรับอ่านค่าจาก transmitter ผ่าน HART protocol พร้อม web app
-สถานะ: **v0.2 — Phase 0 และ 1 เสร็จกับ simulator แล้ว ยังไม่ได้ทดสอบกับ hardware จริง** (ดู §9)
+สถานะ: **v0.3 — Phase 0–1 และแกนของการเขียน parameter เสร็จกับ simulator แล้ว ยังไม่ได้ทดสอบกับ hardware จริง** (ดู §9)
 
 ---
 
@@ -12,19 +12,29 @@
 - อ่านค่ากระบวนการ (PV/SV/TV/QV, loop current, % of range) แบบต่อเนื่อง
 - อ่านข้อมูลประจำตัวอุปกรณ์ (tag, manufacturer, device type, range, damping ฯลฯ)
 - แสดงสถานะและ diagnostic ของอุปกรณ์ (device status, additional status)
+- แก้ไข parameter ของอุปกรณ์ (tag, descriptor, message, range, damping) อย่างมีขั้นตอนป้องกัน
 - ดูทั้งหมดผ่าน web app: ค่าสด, กราฟย้อนหลัง, export CSV
+
+### เงื่อนไขการใช้งาน (ยืนยันจากผู้ใช้แล้ว)
+| เรื่อง | คำตอบ | ผลต่อการออกแบบ |
+|---|---|---|
+| Transmitter | Endress+Hauser, Yokogawa | เป็นชุดทดสอบ hardware หลัก; parameter เฉพาะรุ่นต้องใช้ device-specific command (ดู §10) |
+| ระบบปฏิบัติการ | Windows | serial เป็น `COMx`; ต้องตั้ง latency timer ของ USB-serial; Phase 5 ทำ installer/Windows service |
+| การต่อ | Point-to-point | ใช้ polling address 0 เป็นหลัก; multidrop ยังรองรับแต่ไม่ใช่ลำดับแรก |
+| การเขียน | ต้องการ | เพิ่ม write path พร้อมตัวป้องกัน (§3.7), audit log, หน้า Configure |
 
 ### ขอบเขต v1
 | อยู่ในขอบเขต | อยู่นอกขอบเขต (ไว้ทีหลัง) |
 |---|---|
 | HART 5 / 6 / 7 แบบมีสาย (FSK, Bell 202) | WirelessHART |
-| Universal commands + Common practice ที่เป็นการ **อ่าน** | คำสั่ง **เขียน** ทุกชนิด (re-range, trim, เปลี่ยน tag, fixed current) |
+| Universal + Common practice: **อ่าน** และ **เขียน** tag / descriptor / date / message / range / damping | Trim (45/46), loop test (40), เปลี่ยน polling address (6), เปลี่ยนหน่วย (44) — ทำหลังพิสูจน์ write path กับอุปกรณ์จริง |
 | Point-to-point และ multidrop | Device-specific commands / การอ่านไฟล์ DD/EDDL |
 | Serial HART modem (USB/RS-232) | HART-IP (ออกแบบ interface เผื่อไว้ ทำใน phase 5) |
 | ผู้ใช้คนเดียว/ทีมเล็กบน LAN | Multi-tenant, cloud, ระบบสิทธิ์ละเอียด |
 
-> **เหตุผลที่ v1 เป็น read-only:** คำสั่งเขียนเปลี่ยนพฤติกรรมของ transmitter ที่อาจกำลังควบคุมกระบวนการจริง
-> `Master` (จุดเดียวที่ส่ง byte ออก loop ได้) ตรวจ command number กับ allowlist ใน `hart/tables.py` ก่อนสร้าง frame เสมอ
+> **การเขียนปิดไว้เป็น default:** คำสั่งเขียนเปลี่ยนพฤติกรรมของ transmitter ที่อาจกำลังควบคุมกระบวนการจริง
+> `Master` (จุดเดียวที่ส่ง byte ออก loop ได้) ตรวจ command number ก่อนสร้าง frame เสมอ:
+> คำสั่งอ่านส่งได้ตลอด, คำสั่งเขียนส่งได้เมื่อเปิด `allow_writes` เท่านั้น, คำสั่งที่ไม่อยู่ในรายการใดเลยไม่ถูกส่งไม่ว่ากรณีใด
 
 ---
 
@@ -107,7 +117,7 @@ Browser เข้าถึง serial port เองไม่ได้อย่�
 | 1 | Non-primary variable out of limits | เหลือง |
 | 0 | Primary variable out of limits | เหลือง |
 
-### 3.4 Commands ที่รองรับใน v1 (allowlist)
+### 3.4 Commands ที่รองรับ — อ่าน (`READ_ONLY_COMMANDS`)
 
 | Cmd | ชื่อ | ใช้ทำอะไร | Phase |
 |---|---|---|---|
@@ -124,6 +134,8 @@ Browser เข้าถึง serial port เองไม่ได้อย่�
 | 20 | Read Long Tag (HART 6+) | | 2 |
 | 9 | Read Device Variables with Status (HART 6+) | ค่าพร้อม quality | 4 |
 | 48 | Read Additional Device Status | diagnostic ละเอียด | 4 |
+
+สถานะ: cmd 0–3 และ 12–15 implement แล้ว; 9, 11, 16, 20, 48 ยังไม่ได้ทำ
 
 ### 3.5 Timing และ master state machine
 - 1 transaction ของ command 3 ใช้ราว **0.5 วินาที** ที่ 1200 bps (request ~14 bytes, response ~40 bytes, 11 bit/byte) → poll ได้ประมาณ 2 คำสั่ง/วินาที **รวมทั้ง loop**
@@ -156,6 +168,41 @@ sequenceDiagram
 ```
 
 address 0 = point-to-point (ยังใช้ 4–20 mA), 1–15 (HART 5) หรือ 1–63 (HART 6+) = multidrop
+
+### 3.7 การเขียน parameter (`WRITE_COMMANDS`)
+
+| Cmd | ชื่อ | เขียนอะไร | อ่านกลับด้วย | สถานะ |
+|---|---|---|---|---|
+| 17 | Write Message | ข้อความ 32 ตัวอักษร | 12 | ✅ simulator |
+| 18 | Write Tag, Descriptor, Date | tag 8 / descriptor 16 ตัวอักษร / วันที่ | 13 | ✅ simulator |
+| 34 | Write PV Damping Value | damping (วินาที) | 15 | ✅ simulator |
+| 35 | Write PV Range Values | LRV / URV (หน่วยเดิม) | 15 | ✅ simulator |
+| 44, 6, 38 | PV units, polling address, reset config-changed flag | | | ภายหลัง |
+| 40, 45, 46 | Loop test, trim DAC zero/gain | | | ภายหลัง — ต้องมีขั้นตอนเพิ่ม (ดูด้านล่าง) |
+
+ทุกการเขียนผ่าน `Configurator` (`hart/app/configurator.py`) ซึ่งทำลำดับเดียวกันเสมอ:
+
+```mermaid
+flowchart LR
+    A[ตรวจค่าที่จะเขียน<br/>ความยาว/ตัวอักษร/ตัวเลข] --> B[อ่าน cmd 15<br/>write protect?]
+    B -- protected --> X[หยุด ไม่ส่งอะไร]
+    B -- ok --> C[อ่านค่าเดิม<br/>before]
+    C --> D[ส่งคำสั่งเขียน]
+    D -- response code ≠ 0 --> Y[รายงานเหตุผลจากอุปกรณ์]
+    D --> E[อ่านกลับ<br/>after]
+    E -- ไม่ตรง --> Z[WriteVerifyError]
+    E -- ตรง --> F[คืน before / after / warning]
+```
+
+ตัวป้องกัน เรียงจากชั้นล่างขึ้นบน:
+1. **Master**: ไม่เปิด `allow_writes` → `WriteNotEnabledError` ก่อนสร้าง frame (มี test ยืนยันว่าไม่มี byte ออก)
+2. **Command class**: ตรวจ input ตอนสร้าง (tag ≤ 8, ตัวอักษรที่ pack ได้, ตัวเลข finite, LRV ≠ URV)
+3. **Configurator**: ตรวจ write protect, เขียนเฉพาะ field ที่ขอ (cmd 18 และ 35 เขียนหลายค่าพร้อมกัน จึงอ่านค่าเดิมมาเติม), อ่านกลับยืนยัน
+4. **ผู้ใช้**: ต้องเห็น *ค่าเดิม → ค่าใหม่* แล้วกดยืนยันทุกครั้ง; การเปลี่ยน range เตือนเพิ่มว่า **สัญญาณ 4–20 mA จะเปลี่ยนทันที ให้ปรับ control loop เป็น manual ก่อน**
+5. **Audit log** (Phase 2): บันทึกทุกความพยายามเขียน ทั้งสำเร็จและไม่สำเร็จ
+
+Loop test และ trim ยังไม่ทำ เพราะคำสั่งกลุ่มนี้บังคับค่า output โดยตรงและต้องมีเครื่องวัดอ้างอิง
+ต้องออกแบบขั้นตอนแยก (ยืนยันสองชั้น, ออกจาก fixed current mode อัตโนมัติเมื่อจบ/หลุดการเชื่อมต่อ)
 
 ---
 
@@ -213,7 +260,7 @@ class ReadDynamicVariables(Command[DynamicVariables]):
 │   │   ├── hart/
 │   │   │   ├── transport/     base.py, serial.py, simulator.py
 │   │   │   ├── link/          frame.py, master.py, address.py
-│   │   │   ├── app/           commands/, codec.py (float, packed ASCII), client.py (execute, identify, scan)
+│   │   │   ├── app/           commands/, codec.py, client.py (execute, identify, scan), configurator.py (เขียนแบบมีตัวป้องกัน)
 │   │   │   ├── tables.py      unit codes, manufacturer IDs, response codes
 │   │   │   └── errors.py
 │   │   ├── services/          device_manager.py, poller.py, scanner.py, recorder.py
@@ -274,6 +321,19 @@ erDiagram
         string kind "status_bit | comm_error | online | offline"
         string detail
     }
+    DEVICE ||--o{ WRITE_LOG : has
+    WRITE_LOG {
+        int id PK
+        int device_id FK
+        datetime ts
+        string parameter "tag | descriptor | message | range | damping"
+        json before
+        json requested
+        json after "null ถ้าไม่สำเร็จ"
+        string outcome "ok | rejected | protected | verify_failed | comm_error"
+        string detail
+        string client "IP / ชื่อผู้ใช้"
+    }
 ```
 
 - `READING` เก็บทุกรอบ poll; มี job ลบข้อมูลเก่ากว่า retention (default 90 วัน)
@@ -296,13 +356,16 @@ erDiagram
 | PATCH | `/devices/{id}` | `poll_enabled`, `poll_interval_s` (ตั้งค่าฝั่งซอฟต์แวร์เท่านั้น ไม่เขียนลงอุปกรณ์) |
 | POST | `/devices/{id}/refresh` | อ่านข้อมูลประจำตัวใหม่ (cmd 0, 13–16, 20) |
 | POST | `/devices/{id}/command` | ยิงคำสั่งเดี่ยวใน allowlist → คืนทั้งค่าที่ decode แล้วและ raw frame |
+| GET | `/devices/{id}/config` | tag, descriptor, date, message, range, damping, write protect, sensor limits |
+| PUT | `/devices/{id}/config/{parameter}` | เขียน 1 parameter → คืน `{before, after, warning}`; ปิดอยู่ (403 `WRITE_DISABLED`) ถ้าไม่ได้ตั้ง `HART_ALLOW_WRITE=1` |
+| GET | `/devices/{id}/writes` | audit log ของการเขียน |
 | GET | `/devices/{id}/readings` | `?from&to&max_points` (downsample ฝั่ง server) |
 | GET | `/devices/{id}/readings.csv` | export |
 | GET | `/devices/{id}/events` | ประวัติสถานะ |
 | GET | `/health` | สถานะ port, คิว, สถิติ error |
 
 Error ใช้รูปแบบเดียว: `{"error": {"code": "HART_TIMEOUT", "message": "...", "detail": {...}}}`
-code หลัก: `PORT_NOT_OPEN`, `PORT_BUSY`, `HART_TIMEOUT`, `HART_COMM_ERROR`, `HART_RESPONSE_CODE`, `COMMAND_NOT_ALLOWED`
+code หลัก: `PORT_NOT_OPEN`, `PORT_BUSY`, `HART_TIMEOUT`, `HART_COMM_ERROR`, `HART_RESPONSE_CODE`, `COMMAND_NOT_ALLOWED`, `WRITE_DISABLED`, `WRITE_PROTECTED`, `WRITE_VERIFY_FAILED`, `INVALID_VALUE`
 
 ### 5.2 WebSocket (`/ws`)
 
@@ -334,7 +397,7 @@ Client → server: `{"type":"subscribe","topics":["readings","frames"]}` — `fr
 | หน้า | เนื้อหา |
 |---|---|
 | **Dashboard** | การ์ดต่ออุปกรณ์: tag, PV ตัวใหญ่ + หน่วย, แถบ % of range, mA, badge สถานะ, sparkline 5 นาที |
-| **Device detail** | แท็บ *Live* (PV/SV/TV/QV + กราฟสด) · *Info* (ผล cmd 0/13/14/15/16/20) · *Diagnostics* (status bits, cmd 48, ประวัติ event) · *Raw* (ยิงคำสั่ง, ดู frame hex) |
+| **Device detail** | แท็บ *Live* (PV/SV/TV/QV + กราฟสด) · *Info* (ผล cmd 0/13/14/15/16/20) · *Configure* (แก้ tag/descriptor/message/range/damping + ประวัติการเขียน) · *Diagnostics* (status bits, cmd 48, ประวัติ event) · *Raw* (ยิงคำสั่ง, ดู frame hex) |
 | **Scan** | เลือกช่วง address, แถบความคืบหน้า, รายการที่พบ |
 | **History** | เลือกอุปกรณ์/ตัวแปร/ช่วงเวลา, กราฟซูมได้, export CSV |
 | **Settings** | serial port, master role, preambles, retries, RTS, retention, ภาษา |
@@ -351,6 +414,7 @@ Client → server: `{"type":"subscribe","topics":["readings","frames"]}` — `fr
 ```
 
 ### 6.2 หลักการ UI
+- **การเขียนต้องยืนยันเสมอ**: กล่องยืนยันแสดง tag ของอุปกรณ์, *ค่าเดิม → ค่าใหม่*, และคำเตือนเฉพาะ parameter (range: output เปลี่ยนทันที); หลังเขียนแสดงค่าที่อ่านกลับได้จริง ไม่ใช่ค่าที่พิมพ์; ถ้าอุปกรณ์ write protected หรือ server ปิดการเขียน ให้ปุ่มแก้ไขใช้ไม่ได้พร้อมบอกเหตุผล
 - **ต้องเห็นเสมอว่าค่าสดหรือค้าง**: ทุกค่ามีเวลาที่อัปเดตล่าสุด; เกิน 3 เท่าของ poll interval → ทำสีจางและขึ้น "ข้อมูลค้าง"; ห้ามแสดงค่าเก่าเหมือนเป็นค่าปัจจุบัน
 - สถานะใช้ทั้ง **สี + ไอคอน + ข้อความ** (ไม่พึ่งสีอย่างเดียว)
 - ค่าที่อุปกรณ์ส่ง NaN แสดงเป็น "—" ไม่ใช่ 0
@@ -362,9 +426,10 @@ Client → server: `{"type":"subscribe","topics":["readings","frames"]}` — `fr
 
 ## 7. ความปลอดภัยและการ deploy
 - Default bind `127.0.0.1`; เปิดให้ LAN ต้องตั้งค่าเองและบังคับใส่ token (`Authorization: Bearer`) ทั้ง REST และ WS
-- Command allowlist บังคับใน `hart/link/master.py` ไม่ใช่ที่ API → ไม่มีทางอ้อมผ่าน endpoint อื่น
+- Command allowlist และ write gate บังคับใน `hart/link/master.py` ไม่ใช่ที่ API → ไม่มีทางอ้อมผ่าน endpoint อื่น
+- การเขียนปิดเป็น default (`HART_ALLOW_WRITE=0`); เมื่อเปิดให้ LAN เข้าถึงพร้อมกับเปิดการเขียน ต้องมี token เสมอ
 - Deploy: build frontend เป็น static แล้วให้ FastAPI เสิร์ฟ → รันคำสั่งเดียว, port เดียว
-- Config ผ่าน environment (`HART_PORT`, `HART_TRANSPORT=serial|simulator`, `HART_MASTER=primary|secondary`, `HART_DB_PATH`, `HART_BIND`, `HART_TOKEN`)
+- Config ผ่าน environment (`HART_PORT`, `HART_TRANSPORT=serial|simulator`, `HART_MASTER=primary|secondary`, `HART_ALLOW_WRITE`, `HART_DB_PATH`, `HART_BIND`, `HART_TOKEN`)
 
 ---
 
@@ -389,12 +454,12 @@ Frame จริงที่จับได้จากอุปกรณ์เ�
 |---|---|---|
 | **0 — โครงโปรเจกต์** ✅ | สร้าง backend/frontend, lint, test runner, CI | `pytest` และ `npm test` ผ่านบน CI |
 | **1 — HART core** ◐ | codec, frame, master state machine, cmd 0/1/2/3, SerialTransport, SimulatorTransport, `hartcli` | `hartcli scan` และ `hartcli read 3` ได้ค่าถูกจาก simulator **และ** จาก transmitter จริง 1 ตัว |
-| **2 — Backend service** | cmd 11–16, 20, DeviceManager, Scanner, Poller, SQLite, REST + WS | integration test ผ่าน; poll ต่อเนื่อง 24 ชม. กับ simulator ไม่มี leak/ค้าง |
-| **3 — Web app หลัก** | Dashboard, Scan, Device detail (Live/Info), Settings | ผู้ใช้เปิด browser → scan → เห็นค่าสดได้โดยไม่แตะ command line |
+| **2 — Backend service** | cmd 11, 16, 20, DeviceManager, Scanner, Poller, SQLite, REST + WS, config/write API + audit log | integration test ผ่าน; poll ต่อเนื่อง 24 ชม. กับ simulator ไม่มี leak/ค้าง |
+| **3 — Web app หลัก** | Dashboard, Scan, Device detail (Live/Info/Configure), Settings | ผู้ใช้เปิด browser → scan → เห็นค่าสดได้โดยไม่แตะ command line |
 | **4 — History + Diagnostics** | กราฟย้อนหลัง, CSV, cmd 9/48, event log, raw frame viewer, retention | E2E ผ่าน; ดูย้อนหลัง 30 วันโหลดไม่เกิน 2 วินาที |
 | **5 — เสริม** | HART-IP transport (UDP/TCP 5094), installer/Windows service, multidrop tuning | ตามลำดับความต้องการจริง |
 
-**สถานะ Phase 1:** ผ่านกับ simulator ครบ (unit + integration test, `hartcli scan/read/monitor`)
+**สถานะ Phase 1:** ผ่านกับ simulator ครบ (unit + integration test, `hartcli scan/read/monitor/info/write`) รวมแกนของการเขียน (§3.7) ที่ดึงมาทำก่อนกำหนด
 **ยังค้าง: ทดสอบกับ modem และ transmitter จริง** — `SerialTransport` เขียนแล้วแต่ยังไม่เคยรันกับ hardware
 priority queue ของ bus (§3.5) ยังเป็น lock ธรรมดา จะเพิ่มใน Phase 2 พร้อม Poller
 
@@ -409,11 +474,14 @@ priority queue ของ bus (§3.5) ยังเป็น lock ธรรมด�
 | Modem แต่ละรุ่นจัดการ RTS/echo ต่างกัน | ส่งไม่ออก หรืออ่านเจอ frame ตัวเอง | RTS mode ปรับได้ (`toggle`/`none`), ตัด echo ใน link layer, จดรุ่นที่ทดสอบแล้วใน docs |
 | Timing ของ USB-serial ไม่แม่น (latency timer) | ปล่อย RTS ช้า ชนกับคำตอบ | รอให้ tx buffer ว่างก่อนปล่อย, แนะนำตั้ง latency 1 ms, มี timeout ที่ปรับได้ |
 | มี master อื่นบน loop (DCS, handheld) | ชนกัน, timeout เป็นระยะ | เลือก secondary master ได้, retry + backoff, แสดงสถิติ error |
+| **Parameter เฉพาะรุ่นของ E+H / Yokogawa** (เช่น sensor type, low cut, display, totalizer) | ซอฟต์แวร์นี้อ่าน/เขียนไม่ได้ | parameter เหล่านี้ใช้ device-specific command ซึ่งนิยามใน DD ของแต่ละรุ่น ต้องเพิ่มทีละรุ่นจากคู่มือ HART ของผู้ผลิต — ต้องรู้รุ่นและรายการ parameter ที่ต้องการก่อน |
+| เขียนผิดค่าลงอุปกรณ์ที่ใช้งานอยู่ | กระทบกระบวนการ | ตัวป้องกัน 5 ชั้นใน §3.7; ทดสอบการเขียนครั้งแรกกับอุปกรณ์บนโต๊ะ ไม่ใช่ในกระบวนการ |
+| Layout ของคำสั่งเขียนที่สรุปไว้คลาดเคลื่อน | เขียนค่าผิดความหมาย | อ่านกลับยืนยันทุกครั้ง; ทดสอบกับอุปกรณ์จริงทีละคำสั่งโดยเริ่มจาก message (ไม่มีผลต่อการวัด) |
 | Multidrop หลายตัวทำให้ refresh ช้า | 15 ตัว ≈ 8 วินาที/รอบ | แสดง refresh rate จริงใน UI, ตั้ง interval ต่ออุปกรณ์ได้ |
 | รายละเอียด spec ที่สรุปไว้คลาดเคลื่อน | decode ผิด | ตรวจกับ spec ทางการ + fixture จากอุปกรณ์จริง |
 
-**คำถามที่ต้องการคำตอบจากผู้ใช้ก่อนเริ่ม Phase 1**
-1. ใช้ HART modem รุ่นอะไร และ transmitter ยี่ห้อ/รุ่นอะไรในการทดสอบ
-2. เครื่องที่ต่อ modem เป็น Windows หรือ Linux (เช่น Raspberry Pi / industrial PC)
-3. ใช้งานแบบ point-to-point ทีละตัว หรือ multidrop / ผ่าน HART multiplexer
-4. ในอนาคตต้องการคำสั่งเขียน (re-range, เปลี่ยน tag, loop test) หรือไม่ — ถ้าต้องการจะมีผลต่อการออกแบบสิทธิ์และ audit log
+**คำถามที่ยังเปิด**
+1. HART modem รุ่นอะไร (มีผลกับ RTS mode และ driver บน Windows)
+2. รุ่นของ transmitter (เช่น Yokogawa EJA/EJX, E+H Cerabar/Deltabar/Promag) และ HART revision
+3. นอกจาก tag / descriptor / message / range / damping ต้องการเขียน parameter อะไรอีก — ถ้าเป็น parameter เฉพาะรุ่น ต้องใช้คู่มือ HART command ของรุ่นนั้น
+4. ต้องการ loop test และ trim (cmd 40/45/46) หรือไม่

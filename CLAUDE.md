@@ -6,7 +6,8 @@
 
 ซอฟต์แวร์อ่านค่าจาก transmitter ผ่าน **HART protocol** (ผ่าน HART modem บน serial port) พร้อม web app แสดงค่าสด ประวัติ และ diagnostic
 
-- **สถานะปัจจุบัน: Phase 0–1 เสร็จกับ simulator** (HART core + `hartcli`) — ยังไม่ได้ทดสอบกับ hardware จริง, ยังไม่มี services/API/UI จริง
+- **สถานะปัจจุบัน: Phase 0–1 + แกนการเขียน parameter เสร็จกับ simulator** (HART core + `hartcli`) — ยังไม่ได้ทดสอบกับ hardware จริง, ยังไม่มี services/API/UI จริง
+- เป้าหมายใช้งาน: transmitter Endress+Hauser และ Yokogawa, เครื่อง Windows, ต่อแบบ point-to-point, ต้องเขียน parameter ได้
 - อ่าน [`DESIGN.md`](./DESIGN.md) ก่อนเริ่มงานทุกครั้ง — สถาปัตยกรรม, API, data model และแผน phase อยู่ที่นั่น
 - ทำงานตามลำดับ phase ใน DESIGN.md §9 อย่าข้ามไปทำ UI ก่อน HART core จะผ่าน acceptance
 - ถ้าการ implement ทำให้ต้องเปลี่ยนการออกแบบ ให้แก้ DESIGN.md ใน commit เดียวกัน
@@ -36,6 +37,9 @@ uvicorn app.main:app --reload
 hartcli scan
 hartcli --frames read 3 --address 0             # --frames แสดง hex ของ frame
 hartcli --realtime monitor --address 3          # --realtime จำลองความเร็ว 1200 baud
+hartcli info                                    # tag, range, damping, write protect
+hartcli --allow-write write tag TT-101          # ถามยืนยันก่อนเขียน (--yes เพื่อข้าม)
+hartcli --allow-write write range --upper 150
 hartcli --port COM5 scan                        # modem จริง (ยังไม่เคยทดสอบ)
 
 # Frontend
@@ -48,8 +52,13 @@ npm run build
 
 ## กฎที่ห้ามละเมิด
 
-1. **Read-only**: ส่งได้เฉพาะ HART command ใน allowlist (`READ_ONLY_COMMANDS` ใน `hart/tables.py`, DESIGN.md §3.4) ห้ามเพิ่มคำสั่งเขียน (เช่น 6, 17, 18, 35, 40, 45, 46)
-   เว้นแต่ผู้ใช้สั่งชัดเจน — คำสั่งเหล่านี้เปลี่ยนพฤติกรรม transmitter ในกระบวนการจริง
+1. **การเขียนลงอุปกรณ์ต้องผ่านตัวป้องกันครบ** (DESIGN.md §3.7) — คำสั่งเขียนเปลี่ยนพฤติกรรม transmitter ในกระบวนการจริง
+   - ปิดเป็น default ทุกชั้น (`Master(allow_writes=False)`, `hartcli` ต้องมี `--allow-write`, API ต้องมี `HART_ALLOW_WRITE=1`)
+   - เขียนผ่าน `Configurator` เท่านั้น: ตรวจ write protect → อ่านค่าเดิม → เขียน → อ่านกลับยืนยัน ห้ามเรียก write command ตรง ๆ จาก service/API
+   - ผู้ใช้ต้องเห็น *ค่าเดิม → ค่าใหม่* และยืนยันก่อนทุกครั้ง
+   - เพิ่มคำสั่งเขียนใหม่: ใส่ใน `WRITE_COMMANDS`, ทำ method ใน `Configurator`, มี test ครบ (ปิดอยู่แล้วไม่ส่ง / protected / อุปกรณ์ปฏิเสธ / อ่านกลับไม่ตรง)
+   - **ห้ามเพิ่ม loop test หรือ trim (40, 45, 46) เว้นแต่ผู้ใช้สั่งชัดเจน** และออกแบบขั้นตอนป้องกันเพิ่มก่อน
+   - อย่าทดสอบการเขียนกับอุปกรณ์จริงเองโดยผู้ใช้ไม่ได้สั่ง
 2. **Layering**: `hart/` ห้าม import FastAPI, SQLAlchemy หรืออะไรจาก `services/`, `api/`, `db/`
    command class ต้องไม่มี I/O (รับ bytes คืน dataclass)
 3. **Bus เดียว transaction เดียว**: ทุกการส่งต้องผ่าน master ใน `hart/link` ซึ่งถือ lock ห้ามเขียน serial port ตรงจากที่อื่น

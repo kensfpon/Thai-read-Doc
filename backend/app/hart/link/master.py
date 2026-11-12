@@ -12,6 +12,7 @@ from app.hart.errors import (
     HartCommError,
     HartError,
     HartTimeoutError,
+    WriteNotEnabledError,
 )
 from app.hart.link.address import Address
 from app.hart.link.frame import BadFrame, Frame, FrameParser
@@ -24,6 +25,7 @@ from app.hart.tables import (
     MAX_TX_PREAMBLES,
     READ_ONLY_COMMANDS,
     RESPONSE_CODE_BUSY,
+    WRITE_COMMANDS,
     decode_flags,
 )
 from app.hart.transport.base import Transport
@@ -57,7 +59,7 @@ class Master:
         response_timeout_s: float = 0.3,
         inter_byte_timeout_s: float = 0.1,
         max_transaction_s: float = 3.0,
-        allowed_commands: frozenset[int] = READ_ONLY_COMMANDS,
+        allow_writes: bool = False,
         on_frame: FrameHook | None = None,
     ) -> None:
         self._transport = transport
@@ -66,7 +68,7 @@ class Master:
         self._response_timeout_s = response_timeout_s
         self._inter_byte_timeout_s = inter_byte_timeout_s
         self._max_transaction_s = max_transaction_s
-        self._allowed = allowed_commands
+        self._allow_writes = allow_writes
         self._on_frame = on_frame
         self._lock = asyncio.Lock()
 
@@ -79,7 +81,10 @@ class Master:
         preambles: int = DEFAULT_TX_PREAMBLES,
         retries: int | None = None,
     ) -> Response:
-        if command not in self._allowed:
+        if command in WRITE_COMMANDS:
+            if not self._allow_writes:
+                raise WriteNotEnabledError(command)
+        elif command not in READ_ONLY_COMMANDS:
             raise CommandNotAllowedError(command)
         preambles = min(max(preambles, DEFAULT_TX_PREAMBLES), MAX_TX_PREAMBLES)
         request = Frame(

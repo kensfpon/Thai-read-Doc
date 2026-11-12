@@ -3,6 +3,9 @@
 hartcli scan
 hartcli read 3 --address 0
 hartcli monitor --interval 1
+hartcli info
+hartcli --allow-write write tag TT-101
+hartcli --allow-write write range --lower 0 --upper 150
 hartcli --port COM5 scan            # real modem (default transport is the simulator)
 """
 
@@ -18,14 +21,20 @@ from app.hart.app.client import HartClient
 from app.hart.app.commands import (
     Command,
     DeviceIdentity,
+    DeviceInfo,
     DynamicVariables,
     ReadDynamicVariables,
     ReadLoopCurrentAndPercent,
+    ReadMessage,
     ReadPrimaryVariable,
+    ReadTagDescriptorDate,
+    ReadTransducerInfo,
     ReadUniqueIdentifier,
 )
+from app.hart.app.configurator import Configurator, WriteResult
 from app.hart.errors import HartError
 from app.hart.link.master import Master
+from app.hart.tables import manufacturer_name, unit_name
 from app.hart.transport.base import Transport
 from app.hart.transport.simulator import SimulatedDevice, SimulatorTransport, SimVariable
 
@@ -66,7 +75,7 @@ def fmt(value: float | None, digits: int = 3) -> str:
 def describe(identity: DeviceIdentity) -> str:
     return (
         f"unique ID {identity.unique_id.hex().upper()}  "
-        f"manufacturer 0x{identity.manufacturer_id:02X}  "
+        f"{manufacturer_name(identity.manufacturer_id)}  "
         f"device type 0x{identity.device_type:0{4 if identity.hart_revision >= 7 else 2}X}  "
         f"HART {identity.hart_revision}"
     )
@@ -135,6 +144,88 @@ async def cmd_monitor(client: HartClient, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_info(client: HartClient, args: argparse.Namespace) -> int:
+    identity = await client.identify(args.address)
+    tdd = (await client.execute_on(identity, ReadTagDescriptorDate())).value
+    message = (await client.execute_on(identity, ReadMessage())).value
+    info = await Configurator(client).read_info(identity)
+    sensor = (await client.execute_on(identity, ReadTransducerInfo())).value
+    sensor_unit = "" if sensor.unit_code is None else unit_name(sensor.unit_code)
+    print(describe(identity))
+    print(f"  tag            {tdd.tag}")
+    print(f"  descriptor     {tdd.descriptor}")
+    print(f"  date           {tdd.date or '—'}")
+    print(f"  message        {message}")
+    print(f"  range LRV..URV {fmt(info.lower_range)} .. {fmt(info.upper_range)} {info.range_unit}")
+    print(f"  damping        {fmt(info.damping_s)} s")
+    print(f"  sensor limits  {fmt(sensor.lower_limit)} .. {fmt(sensor.upper_limit)} {sensor_unit}")
+    print(f"  write protect  {'yes' if info.is_write_protected else 'no'}")
+    return 0
+
+
+def confirm(args: argparse.Namespace, summary: str, caution: str = "") -> bool:
+    print(summary)
+    if caution:
+        print(f"  CAUTION: {caution}")
+    if args.yes:
+        return True
+    return input("  write to the device? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def report(result: WriteResult[Any], before: str, after: str) -> int:
+    print(f"  written and verified: {before} -> {after}")
+    if result.warning:
+        print(f"  device {result.warning}")
+    return 0
+
+
+def show_range(info: DeviceInfo) -> str:
+    return f"{fmt(info.lower_range)} .. {fmt(info.upper_range)} {info.range_unit}"
+
+
+async def cmd_write(client: HartClient, args: argparse.Namespace) -> int:
+    if not args.allow_write:
+        print("writes are disabled; pass --allow-write before the subcommand", file=sys.stderr)
+        return 2
+    config = Configurator(client)
+    identity = await client.identify(args.address)
+    print(describe(identity))
+    if args.parameter in ("tag", "descriptor"):
+        current = (await client.execute_on(identity, ReadTagDescriptorDate())).value
+        old = getattr(current, args.parameter)
+        if not confirm(args, f"  {args.parameter}: {old!r} -> {args.value!r}"):
+            return 1
+        tdd = await config.write_tag_descriptor_date(identity, **{args.parameter: args.value})
+        return report(
+            tdd, repr(getattr(tdd.before, args.parameter)), repr(getattr(tdd.after, args.parameter))
+        )
+    if args.parameter == "message":
+        old = (await client.execute_on(identity, ReadMessage())).value
+        if not confirm(args, f"  message: {old!r} -> {args.value!r}"):
+            return 1
+        text = await config.write_message(identity, args.value)
+        return report(text, repr(text.before), repr(text.after))
+    info = await config.read_info(identity)
+    if args.parameter == "damping":
+        if not confirm(args, f"  damping: {fmt(info.damping_s)} s -> {fmt(args.value)} s"):
+            return 1
+        damping = await config.write_damping(identity, args.value)
+        return report(damping, f"{fmt(damping.before)} s", f"{fmt(damping.after)} s")
+    if args.lower is None and args.upper is None:
+        print("give --lower and/or --upper", file=sys.stderr)
+        return 2
+    lower = info.lower_range if args.lower is None else args.lower
+    upper = info.upper_range if args.upper is None else args.upper
+    if not confirm(
+        args,
+        f"  range: {show_range(info)} -> {fmt(lower)} .. {fmt(upper)} {info.range_unit}",
+        "this rescales the 4-20 mA output immediately; put the control loop in manual first",
+    ):
+        return 1
+    ranged = await config.write_range(identity, lower=args.lower, upper=args.upper)
+    return report(ranged, show_range(ranged.before), show_range(ranged.after))
+
+
 async def run(args: argparse.Namespace) -> int:
     def show(direction: str, raw: bytes) -> None:
         print(f"    {direction} {raw.hex(' ').upper()}")
@@ -146,11 +237,18 @@ async def run(args: argparse.Namespace) -> int:
             transport,
             primary=args.master == "primary",
             retries=args.retries,
+            allow_writes=args.allow_write and args.action == "write",
             on_frame=show if args.frames else None,
         )
-        handler = {"scan": cmd_scan, "read": cmd_read, "monitor": cmd_monitor}[args.action]
+        handler = {
+            "scan": cmd_scan,
+            "read": cmd_read,
+            "monitor": cmd_monitor,
+            "info": cmd_info,
+            "write": cmd_write,
+        }[args.action]
         return await handler(HartClient(master), args)
-    except HartError as exc:
+    except (HartError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
@@ -163,6 +261,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rts", choices=["toggle", "none"], default="toggle")
     parser.add_argument("--master", choices=["primary", "secondary"], default="primary")
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument(
+        "--allow-write", action="store_true", help="permit the write subcommand to change a device"
+    )
     parser.add_argument("--frames", action="store_true", help="print raw frames as hex")
     parser.add_argument(
         "--realtime", action="store_true", help="simulator: pace bytes at 1200 baud"
@@ -181,6 +282,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     monitor.add_argument("--address", type=int, default=0, help="polling address")
     monitor.add_argument("--interval", type=float, default=1.0)
     monitor.add_argument("--count", type=int, default=0, help="stop after N readings (0 = forever)")
+
+    info = sub.add_parser("info", help="read tag, range, damping and other configuration")
+    info.add_argument("--address", type=int, default=0, help="polling address")
+
+    write = sub.add_parser("write", help="change a parameter (needs --allow-write)")
+    write.add_argument("--address", type=int, default=0, help="polling address")
+    write.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    params = write.add_subparsers(dest="parameter", required=True)
+    for name in ("tag", "descriptor", "message"):
+        params.add_parser(name).add_argument("value")
+    params.add_parser("damping").add_argument("value", type=float, help="seconds")
+    range_parser = params.add_parser("range", help="PV lower/upper range values (LRV/URV)")
+    range_parser.add_argument("--lower", type=float)
+    range_parser.add_argument("--upper", type=float)
     return parser.parse_args(argv)
 
 

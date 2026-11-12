@@ -17,8 +17,23 @@ FRAME_BACK = 0x01  # burst frame, slave -> master
 FRAME_STX = 0x02  # master -> slave
 FRAME_ACK = 0x06  # slave -> master
 
-# The only commands the master will ever transmit. All of them are reads.
+# Commands the master may always transmit. All of them are reads.
 READ_ONLY_COMMANDS: frozenset[int] = frozenset({0, 1, 2, 3, 9, 11, 12, 13, 14, 15, 16, 20, 48})
+
+# Commands that change the device's configuration. The master transmits these only
+# when it was created with ``allow_writes=True``. Anything in neither set is never sent.
+#   17 Write Message, 18 Write Tag/Descriptor/Date,
+#   34 Write PV Damping Value, 35 Write PV Range Values
+WRITE_COMMANDS: frozenset[int] = frozenset({17, 18, 34, 35})
+
+# Command 15 "write protect code".
+WRITE_PROTECTED = 1
+
+MANUFACTURERS: dict[int, str] = {
+    0x11: "Endress+Hauser",
+    0x26: "Rosemount",
+    0x37: "Yokogawa",
+}
 
 # Float value devices send when a variable is not available.
 NAN_NOT_AVAILABLE = bytes.fromhex("7FA00000")
@@ -51,6 +66,8 @@ RESPONSE_CODES: dict[int, str] = {
     5: "too few data bytes received",
     6: "device-specific command error",
     7: "in write protect mode",
+    3: "passed parameter too large",
+    4: "passed parameter too small",
     16: "access restricted",
     32: "busy",
     33: "delayed response initiated",
@@ -105,6 +122,10 @@ UNITS: dict[int, str] = {
     250: "",  # not used
     251: "",  # none
 }
+
+
+def manufacturer_name(code: int) -> str:
+    return MANUFACTURERS.get(code, f"manufacturer 0x{code:02X}")
 
 
 def unit_name(code: int) -> str:

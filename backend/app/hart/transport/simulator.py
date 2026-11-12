@@ -8,13 +8,21 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from app.hart.app.codec import encode_float
+from app.hart.app.codec import (
+    decode_float,
+    decode_packed_ascii,
+    encode_float,
+    encode_packed_ascii,
+)
 from app.hart.link.address import Address
 from app.hart.link.frame import Frame, FrameParser
 from app.hart.tables import FRAME_ACK, FRAME_STX
 
 _BYTE_TIME_S = 11 / 1200  # start + 8 data + parity + stop at 1200 baud
 _RC_NOT_IMPLEMENTED = 64
+_RC_TOO_FEW_BYTES = 5
+_RC_WRITE_PROTECTED = 7
+_STATUS_CONFIG_CHANGED = 0x40
 
 
 @dataclass
@@ -41,6 +49,16 @@ class SimulatedDevice:
     lower_range: float = 0.0
     upper_range: float = 100.0
     device_status: int = 0
+    # Configuration, changed by write commands. Text is stored packed, as on the wire.
+    tag: str = "SIM-001"
+    descriptor: str = "SIMULATED DEVICE"
+    date: bytes = bytes([1, 1, 126])  # 1 Jan 2026
+    message: str = "HART SIMULATOR"
+    damping_s: float = 0.5
+    max_damping_s: float = 32.0
+    sensor_lower_limit: float = -200.0
+    sensor_upper_limit: float = 850.0
+    write_protected: bool = False
     variables: list[SimVariable] = field(
         default_factory=lambda: [SimVariable(32, 25.0, 5.0), SimVariable(32, 24.0)]
     )
@@ -63,10 +81,94 @@ class SimulatedDevice:
         clamped = min(max(current, 3.8), 20.5)
         return clamped, percent, (0x04 if clamped != current else 0)
 
-    def respond(self, command: int, t: float) -> tuple[int, int, bytes]:
+    def _tag_descriptor_date(self) -> bytes:
+        return (
+            encode_packed_ascii(self.tag, 6) + encode_packed_ascii(self.descriptor, 12) + self.date
+        )
+
+    def _device_info(self) -> bytes:
+        unit = self.variables[0].unit_code if self.variables else 251
+        return (
+            bytes([0, 0, unit])  # alarm selection, transfer function (linear), range unit
+            + encode_float(self.upper_range)
+            + encode_float(self.lower_range)
+            + encode_float(self.damping_s)
+            + bytes([1 if self.write_protected else 0, 250])
+        )
+
+    def _write(self, command: int, data: bytes) -> tuple[int, bytes] | None:
+        """Apply a write command. Returns (response code, payload), or None if not a write."""
+        lengths = {17: 24, 18: 21, 34: 4, 35: 9}
+        if command not in lengths:
+            return None
+        if self.write_protected:
+            return _RC_WRITE_PROTECTED, b""
+        if len(data) < lengths[command]:
+            return _RC_TOO_FEW_BYTES, b""
+        code = 0
+        if command == 17:
+            self.message = decode_packed_ascii(data[:24])
+            payload = encode_packed_ascii(self.message, 24)
+        elif command == 18:
+            self.tag = decode_packed_ascii(data[0:6])
+            self.descriptor = decode_packed_ascii(data[6:18])
+            self.date = bytes(data[18:21])
+            payload = self._tag_descriptor_date()
+        elif command == 34:
+            damping = decode_float(data, 0)
+            if damping is None or damping < 0:
+                return 4, b""
+            if damping > self.max_damping_s:
+                return 3, b""
+            self.damping_s = damping
+            payload = encode_float(self.damping_s)
+        else:
+            unit = self.variables[0].unit_code if self.variables else 251
+            upper, lower = decode_float(data, 1), decode_float(data, 5)
+            lo, hi = self.sensor_lower_limit, self.sensor_upper_limit
+            if data[0] != unit:
+                return 2, b""  # the simulator does not convert units
+            if upper is None or lower is None or upper == lower:
+                return 13, b""
+            if lower > hi:
+                return 9, b""
+            if lower < lo:
+                return 10, b""
+            if upper > hi:
+                return 11, b""
+            if upper < lo:
+                return 12, b""
+            self.upper_range, self.lower_range = upper, lower
+            payload = bytes([unit]) + encode_float(upper) + encode_float(lower)
+        self.device_status |= _STATUS_CONFIG_CHANGED
+        return code, payload
+
+    def respond(self, command: int, t: float, data: bytes = b"") -> tuple[int, int, bytes]:
         """Return (response code, device status, payload)."""
+        written = self._write(command, data)
         current, percent, extra_status = self._loop(t)
         status = self.device_status | extra_status
+        if written is not None:
+            return written[0], status, written[1]
+        if command == 12:
+            return 0, status, encode_packed_ascii(self.message, 24)
+        if command == 13:
+            return 0, status, self._tag_descriptor_date()
+        if command == 14:
+            unit = self.variables[0].unit_code if self.variables else 251
+            return (
+                0,
+                status,
+                (
+                    (self.device_id & 0xFFFFFF).to_bytes(3, "big")
+                    + bytes([unit])
+                    + encode_float(self.sensor_upper_limit)
+                    + encode_float(self.sensor_lower_limit)
+                    + encode_float(1.0)
+                ),
+            )
+        if command == 15:
+            return 0, status, self._device_info()
         if command == 0:
             payload = bytes(
                 [
@@ -183,7 +285,7 @@ class SimulatorTransport:
         if self.drop_responses > 0:
             self.drop_responses -= 1
             return b""
-        code, status, payload = device.respond(request.command, self._clock())
+        code, status, payload = device.respond(request.command, self._clock(), request.data)
         # At most one fault per response, so each one costs exactly one retry.
         corrupt = False
         if self.comm_error_responses > 0:

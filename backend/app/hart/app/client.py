@@ -49,7 +49,8 @@ class HartClient:
             raise HartResponseError(
                 command.number,
                 response.response_code,
-                response_code_name(response.response_code),
+                command.response_codes.get(response.response_code)
+                or response_code_name(response.response_code),
             )
         return Reply(
             value=command.decode(response.payload),

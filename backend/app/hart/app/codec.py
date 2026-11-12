@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import math
 import struct
 
@@ -28,6 +29,23 @@ def decode_uint(data: bytes, offset: int, length: int) -> int | None:
 
 def byte_at(data: bytes, offset: int) -> int | None:
     return data[offset] if offset < len(data) else None
+
+
+def decode_date(data: bytes, offset: int = 0) -> datetime.date | None:
+    """3 bytes: day, month, year - 1900. ``None`` if missing or not a real date."""
+    chunk = data[offset : offset + 3]
+    if len(chunk) < 3:
+        return None
+    try:
+        return datetime.date(1900 + chunk[2], chunk[1], chunk[0])
+    except ValueError:
+        return None
+
+
+def encode_date(value: datetime.date) -> bytes:
+    if not 1900 <= value.year <= 2155:
+        raise ValueError("HART dates cover the years 1900..2155")
+    return bytes([value.day, value.month, value.year - 1900])
 
 
 def decode_packed_ascii(data: bytes) -> str:

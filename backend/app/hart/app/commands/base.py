@@ -9,6 +9,8 @@ T = TypeVar("T")
 
 class Command[T]:
     number: ClassVar[int]
+    # Command-specific meanings of response codes (override the common table).
+    response_codes: ClassVar[dict[int, str]] = {}
 
     def encode(self) -> bytes:
         """Request data bytes."""

@@ -128,8 +128,8 @@ async def test_write_commands_never_reach_the_wire():
 
 
 async def test_unimplemented_command_raises_response_error():
-    class ReadMessage(Command[bytes]):
-        number = 12
+    class ReadFinalAssembly(Command[bytes]):
+        number = 16
 
         def decode(self, payload: bytes) -> bytes:
             return payload
@@ -138,7 +138,7 @@ async def test_unimplemented_command_raises_response_error():
     client, _ = make(sim)
     identity = await client.identify(0)
     with pytest.raises(HartResponseError) as info:
-        await client.execute_on(identity, ReadMessage())
+        await client.execute_on(identity, ReadFinalAssembly())
     assert info.value.code == 64
 
 
